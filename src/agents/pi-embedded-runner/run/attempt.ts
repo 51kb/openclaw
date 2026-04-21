@@ -1988,7 +1988,7 @@ export async function runEmbeddedAttempt(
                   log.warn(`before_agent_run hook approval timed out (behavior=allow), proceeding`);
                 }
               } else {
-                log.warn(`before_agent_run hook approval granted (${approvalResult}), proceeding`);
+                log.debug(`before_agent_run hook approval granted (${approvalResult}), proceeding`);
               }
             }
           }
@@ -2508,9 +2508,12 @@ export async function runEmbeddedAttempt(
             channelId: params.messageChannel ?? params.messageProvider ?? undefined,
           },
         );
-        if (llmOutputDecision?.outcome === "block") {
-          log.warn(`llm_output hook blocked: ${llmOutputDecision.reason}`);
-          // Redact the assistant response from the transcript
+        // Helper: redact assistant messages from the transcript and clear assistantTexts
+        const redactLlmOutputResponse = async (
+          reason: string,
+          hookPoint: string,
+          replacementMessage?: string,
+        ) => {
           const { redactMessages } = await import("../../../plugins/hook-redaction.js");
           await redactMessages(
             params.sessionFile,
@@ -2521,40 +2524,30 @@ export async function runEmbeddedAttempt(
               },
             },
             {
-              reason: llmOutputDecision.reason,
-              hookPoint: "llm_output",
+              reason,
+              hookPoint,
               pluginId: "unknown",
               timestamp: Date.now(),
             },
           );
-          // Clear assistantTexts so the caller doesn't surface the blocked content
           assistantTexts.length = 0;
-          // Set error so the caller knows to surface the userMessage
+          if (replacementMessage) {
+            assistantTexts.push(replacementMessage);
+          }
+        };
+
+        if (llmOutputDecision?.outcome === "block") {
+          log.warn(`llm_output hook blocked: ${llmOutputDecision.reason}`);
+          await redactLlmOutputResponse(llmOutputDecision.reason, "llm_output");
           promptError = new Error(llmOutputDecision.userMessage ?? "Response blocked by policy.");
           promptErrorSource = "hook:llm_output";
         } else if (llmOutputDecision?.outcome === "redact") {
           log.warn(`llm_output hook redacted: ${llmOutputDecision.reason}`);
-          const { redactMessages } = await import("../../../plugins/hook-redaction.js");
-          await redactMessages(
-            params.sessionFile,
-            {
-              match: {
-                role: "assistant",
-                contentSubstring: (assistantTexts[0] ?? "").slice(0, 100),
-              },
-            },
-            {
-              reason: llmOutputDecision.reason,
-              hookPoint: "llm_output",
-              pluginId: "unknown",
-              timestamp: Date.now(),
-            },
+          await redactLlmOutputResponse(
+            llmOutputDecision.reason,
+            "llm_output",
+            llmOutputDecision.replacementMessage,
           );
-          // Replace the assistant text with the replacement message
-          assistantTexts.length = 0;
-          if (llmOutputDecision.replacementMessage) {
-            assistantTexts.push(llmOutputDecision.replacementMessage);
-          }
         } else if (llmOutputDecision?.outcome === "ask") {
           log.warn(`llm_output hook requesting approval: ${llmOutputDecision.reason}`);
           const { requestHookApproval } = await import("../../../plugins/hook-approval.js");
@@ -2576,29 +2569,13 @@ export async function runEmbeddedAttempt(
               (llmOutputDecision.timeoutBehavior ?? "deny") === "deny");
           if (shouldDeny) {
             log.warn(`llm_output hook approval denied/timed out, redacting response`);
-            // Retract the streamed response — same as redact path
-            const { redactMessages } = await import("../../../plugins/hook-redaction.js");
-            await redactMessages(
-              params.sessionFile,
-              {
-                match: {
-                  role: "assistant",
-                  contentSubstring: (assistantTexts[0] ?? "").slice(0, 100),
-                },
-              },
-              {
-                reason: llmOutputDecision.reason,
-                hookPoint: "llm_output:ask",
-                pluginId: "unknown",
-                timestamp: Date.now(),
-              },
+            await redactLlmOutputResponse(
+              llmOutputDecision.reason,
+              "llm_output:ask",
+              llmOutputDecision.denialMessage ?? "Response withheld pending review.",
             );
-            assistantTexts.length = 0;
-            const denialMsg =
-              llmOutputDecision.denialMessage ?? "Response withheld pending review.";
-            assistantTexts.push(denialMsg);
           } else {
-            log.warn(`llm_output hook approval granted (${approvalResult}), delivering response`);
+            log.debug(`llm_output hook approval granted (${approvalResult}), delivering response`);
           }
         }
       }

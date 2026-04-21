@@ -12,6 +12,21 @@ describe("HookDecision types", () => {
       expect(isHookDecision({ outcome: "pass" })).toBe(true);
     });
 
+    it("recognizes ask", () => {
+      expect(
+        isHookDecision({
+          outcome: "ask",
+          reason: "check",
+          title: "Review",
+          description: "Continue?",
+        }),
+      ).toBe(true);
+    });
+
+    it("recognizes ask with minimal fields", () => {
+      expect(isHookDecision({ outcome: "ask", reason: "check" })).toBe(true);
+    });
+
     it("recognizes block", () => {
       expect(isHookDecision({ outcome: "block", reason: "test" })).toBe(true);
     });
@@ -46,13 +61,25 @@ describe("HookDecision types", () => {
       expect(HOOK_DECISION_SEVERITY.pass).toBe(0);
     });
 
-    it("severity order is pass < block < redact", () => {
-      expect(HOOK_DECISION_SEVERITY.pass).toBeLessThan(HOOK_DECISION_SEVERITY.block);
+    it("ask has severity 1", () => {
+      expect(HOOK_DECISION_SEVERITY.ask).toBe(1);
+    });
+
+    it("severity order is pass < ask < block < redact", () => {
+      expect(HOOK_DECISION_SEVERITY.pass).toBeLessThan(HOOK_DECISION_SEVERITY.ask);
+      expect(HOOK_DECISION_SEVERITY.ask).toBeLessThan(HOOK_DECISION_SEVERITY.block);
       expect(HOOK_DECISION_SEVERITY.block).toBeLessThan(HOOK_DECISION_SEVERITY.redact);
     });
   });
 
   describe("mergeHookDecisions", () => {
+    const askDecision: HookDecision = {
+      outcome: "ask",
+      reason: "needs approval",
+      title: "Approval Required",
+      description: "Continue with this action?",
+    };
+
     it("returns b when a is undefined", () => {
       const b: HookDecision = { outcome: "pass" };
       expect(mergeHookDecisions(undefined, b)).toBe(b);
@@ -62,6 +89,48 @@ describe("HookDecision types", () => {
       const a: HookDecision = { outcome: "pass" };
       const b: HookDecision = { outcome: "pass" };
       expect(mergeHookDecisions(a, b)).toBe(a);
+    });
+
+    it("escalates pass → ask", () => {
+      const a: HookDecision = { outcome: "pass" };
+      expect(mergeHookDecisions(a, askDecision)).toBe(askDecision);
+    });
+
+    it("ask beats pass", () => {
+      const b: HookDecision = { outcome: "pass" };
+      expect(mergeHookDecisions(askDecision, b)).toBe(askDecision);
+    });
+
+    it("block beats ask", () => {
+      const b: HookDecision = { outcome: "block", reason: "test" };
+      expect(mergeHookDecisions(askDecision, b)).toBe(b);
+    });
+
+    it("redact beats ask", () => {
+      const b: HookDecision = { outcome: "redact", reason: "r" };
+      expect(mergeHookDecisions(askDecision, b)).toBe(b);
+    });
+
+    it("keeps first ask when severities match", () => {
+      const a: HookDecision = askDecision;
+      const b: HookDecision = {
+        outcome: "ask",
+        reason: "second approval",
+        title: "Second Check",
+        description: "Continue anyway?",
+      };
+      expect(mergeHookDecisions(a, b)).toBe(a);
+    });
+
+    it("ask does not downgrade to pass", () => {
+      const b: HookDecision = { outcome: "pass" };
+      expect(mergeHookDecisions(askDecision, b).outcome).toBe("ask");
+    });
+
+    it("redact beats block", () => {
+      const a: HookDecision = { outcome: "block", reason: "b" };
+      const b: HookDecision = { outcome: "redact", reason: "r" };
+      expect(mergeHookDecisions(a, b)).toBe(b);
     });
 
     it("escalates pass → block", () => {
