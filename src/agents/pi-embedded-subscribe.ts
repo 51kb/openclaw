@@ -806,6 +806,29 @@ export function subscribeEmbeddedPiSession(params: SubscribeEmbeddedPiSessionPar
         state.livenessState = meta.livenessState;
       }
     },
+    /**
+     * Resolve a deferred terminal lifecycle event.  When `llm_output` hooks
+     * are registered, `handleAgentEnd` stores the emit closure on
+     * `state.deferredTerminalLifecycle` instead of firing immediately.
+     *
+     * Call with no args to emit the original outcome ("end").
+     * Call with `{ error }` to override to a lifecycle error ("error").
+     *
+     * If no deferral is pending this is a harmless no-op.
+     */
+    resolveTerminalLifecycle: (override?: { error: string }) => {
+      const deferred = state.deferredTerminalLifecycle;
+
+      if (!deferred) {
+        return;
+      }
+      state.deferredTerminalLifecycle = undefined;
+      if (override) {
+        deferred.emitError(override.error);
+      } else {
+        deferred.emit();
+      }
+    },
     isCompacting: () => state.compactionInFlight || state.pendingCompactionRetry > 0,
     isCompactionInFlight: () => state.compactionInFlight,
     getMessagingToolSentTexts: () => messagingToolSentTexts.slice(),

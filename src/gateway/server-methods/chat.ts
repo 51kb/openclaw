@@ -1535,6 +1535,28 @@ function nextChatSeq(context: { agentRunSeq: Map<string, number> }, runId: strin
   return next;
 }
 
+/**
+ * Returns true (and consumes the marker) when this run was already
+ * terminally finalized via the chat event pipeline by an `llm_output` hook
+ * block. The chat.send `.then()` callback uses this to avoid re-emitting a
+ * second `state: "final"` (with the run-failed fallback text) that would
+ * overwrite the hook block message in the control-ui.
+ */
+function consumeHookFinalizedRun(
+  context: Pick<GatewayRequestContext, "chatHookFinalizedRuns" | "agentRunSeq">,
+  runId: string,
+): boolean {
+  const has = context.chatHookFinalizedRuns.has(runId);
+  if (!has) {
+    return false;
+  }
+  context.chatHookFinalizedRuns.delete(runId);
+  // The lifecycle handler emitted the terminal payload; drop the seq
+  // counter so a subsequent run with the same id (unlikely) starts fresh.
+  context.agentRunSeq.delete(runId);
+  return true;
+}
+
 function broadcastChatFinal(params: {
   context: Pick<GatewayRequestContext, "broadcast" | "nodeSendToSession" | "agentRunSeq">;
   runId: string;
@@ -2189,6 +2211,26 @@ export const chatHandlers: GatewayRequestHandlers = {
       })
         .then(async () => {
           await rewriteUserTranscriptMedia();
+          // When the lifecycle event handler already broadcast the terminal
+          // chat payloads in response to an `llm_output` hook block, skip
+          // the chat.send-owned final/error broadcasts here. Otherwise the
+          // run-failed fallback text returned by agent-runner-execution
+          // would be re-broadcast as a second `state: "final"` and the
+          // control-ui (which trusts the most recent `state: "final"`)
+          // would overwrite the hook block message.
+          if (consumeHookFinalizedRun(context, clientRunId)) {
+            void emitUserTranscriptUpdate();
+            setGatewayDedupeEntry({
+              dedupe: context.dedupe,
+              key: `chat:${clientRunId}`,
+              entry: {
+                ts: Date.now(),
+                ok: true,
+                payload: { runId: clientRunId, status: "ok" as const },
+              },
+            });
+            return;
+          }
           if (!agentRunStarted) {
             await emitUserTranscriptUpdate();
             const btwReplies = deliveredReplies
@@ -2285,6 +2327,11 @@ export const chatHandlers: GatewayRequestHandlers = {
               `webchat user transcript update failed after error: ${formatForLog(transcriptErr)}`,
             );
           });
+          // If the lifecycle handler already broadcast the terminal payloads
+          // for a hook_block, suppress the chat.send-owned chat.error event
+          // here so the UI is not whacked with a generic error message
+          // after the block message has already been displayed.
+          const hookFinalized = consumeHookFinalizedRun(context, clientRunId);
           const error = errorShape(ErrorCodes.UNAVAILABLE, String(err));
           setGatewayDedupeEntry({
             dedupe: context.dedupe,
@@ -2300,12 +2347,14 @@ export const chatHandlers: GatewayRequestHandlers = {
               error,
             },
           });
-          broadcastChatError({
-            context,
-            runId: clientRunId,
-            sessionKey,
-            errorMessage: String(err),
-          });
+          if (!hookFinalized) {
+            broadcastChatError({
+              context,
+              runId: clientRunId,
+              sessionKey,
+              errorMessage: String(err),
+            });
+          }
         })
         .finally(() => {
           context.chatAbortControllers.delete(clientRunId);

@@ -84,6 +84,19 @@ export type EmbeddedPiSubscribeState = {
   deterministicApprovalPromptPending: boolean;
   deterministicApprovalPromptSent: boolean;
   lastAssistant?: AgentMessage;
+
+  /**
+   * When `llm_output` hooks are registered, the terminal lifecycle event
+   * (phase "end" or "error") is deferred until the hook has finished
+   * inspecting the response.  `attempt.ts` calls
+   * `subscription.resolveTerminalLifecycle()` after processing the hook
+   * result — either confirming the original outcome or overriding it with
+   * an error.
+   */
+  deferredTerminalLifecycle?: {
+    emit: () => void;
+    emitError: (error: string) => void;
+  };
 };
 
 export type EmbeddedPiSubscribeContext = {

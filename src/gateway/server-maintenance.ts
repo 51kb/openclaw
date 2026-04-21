@@ -30,7 +30,7 @@ export function startGatewayMaintenanceTimers(params: {
   logHealth: { error: (msg: string) => void };
   dedupe: Map<string, DedupeEntry>;
   chatAbortControllers: Map<string, ChatAbortControllerEntry>;
-  chatRunState: { abortedRuns: Map<string, number> };
+  chatRunState: { abortedRuns: Map<string, number>; hookFinalizedRuns: Map<string, number> };
   chatRunBuffers: Map<string, string>;
   chatDeltaSentAt: Map<string, number>;
   chatDeltaLastBroadcastLen: Map<string, number>;
@@ -134,6 +134,18 @@ export function startGatewayMaintenanceTimers(params: {
       params.chatRunBuffers.delete(runId);
       params.chatDeltaSentAt.delete(runId);
       params.chatDeltaLastBroadcastLen.delete(runId);
+    }
+
+    // Sweep stale `hookFinalizedRuns` markers in case the chat.send
+    // `.then()`/`.catch()` callbacks never ran (e.g. process crash before
+    // consume). The marker is normally consumed within the same tick that
+    // it was set, so any entry older than the abort TTL is definitely
+    // orphaned.
+    for (const [runId, finalizedAt] of params.chatRunState.hookFinalizedRuns) {
+      if (now - finalizedAt <= ABORTED_RUN_TTL_MS) {
+        continue;
+      }
+      params.chatRunState.hookFinalizedRuns.delete(runId);
     }
 
     // Prune expired control-plane rate-limit buckets to prevent unbounded

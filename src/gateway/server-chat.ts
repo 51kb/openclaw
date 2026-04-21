@@ -202,6 +202,16 @@ export type ChatRunState = {
   /** Length of text at the time of the last broadcast, used to avoid duplicate flushes. */
   deltaLastBroadcastLen: Map<string, number>;
   abortedRuns: Map<string, number>;
+  /**
+   * Runs that have already been terminally finalized via the chat event
+   * pipeline by an `llm_output` hook block. The downstream `chat.send`
+   * `.then()` callback consults this map to suppress the second
+   * `broadcastChatFinal` (which would otherwise overwrite the hook block
+   * message in the UI with the run-failed fallback text).
+   *
+   * Values are timestamps (ms) so the maintenance sweep can age entries out.
+   */
+  hookFinalizedRuns: Map<string, number>;
   clear: () => void;
 };
 
@@ -212,6 +222,7 @@ export function createChatRunState(): ChatRunState {
   const deltaSentAt = new Map<string, number>();
   const deltaLastBroadcastLen = new Map<string, number>();
   const abortedRuns = new Map<string, number>();
+  const hookFinalizedRuns = new Map<string, number>();
 
   const clear = () => {
     registry.clear();
@@ -220,6 +231,7 @@ export function createChatRunState(): ChatRunState {
     deltaSentAt.clear();
     deltaLastBroadcastLen.clear();
     abortedRuns.clear();
+    hookFinalizedRuns.clear();
   };
 
   return {
@@ -229,6 +241,7 @@ export function createChatRunState(): ChatRunState {
     deltaSentAt,
     deltaLastBroadcastLen,
     abortedRuns,
+    hookFinalizedRuns,
     clear,
   };
 }
@@ -443,6 +456,7 @@ const CHAT_ERROR_KINDS = new Set<ErrorKind>([
   "timeout",
   "rate_limit",
   "context_length",
+  "hook_block",
   "unknown",
 ]);
 
@@ -843,12 +857,55 @@ export function createAgentEventHandler({
       nodeSendToSession(sessionKey, "chat", payload);
       return;
     }
+    // When an error arrives after streaming deltas were already sent (e.g.
+    // an llm_output hook blocked the response post-completion), emit a
+    // `state: "final"` with the error message as content so the UI
+    // replaces the streamed text.  The control-ui reliably handles
+    // "final" after deltas but may not clear streamed content on "error".
+    const errorText = error ? formatForLog(error) : undefined;
+    if (errorKind === "hook_block" && errorText) {
+      // Emit a "final" with the block message as content to replace the
+      // streamed deltas, then immediately follow with an "error" so UIs
+      // that only clear on error also show the block.
+      const finalPayload = {
+        runId: clientRunId,
+        sessionKey,
+        seq,
+        state: "final" as const,
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: errorText }],
+          timestamp: Date.now(),
+        },
+      };
+      broadcast("chat", finalPayload);
+      nodeSendToSession(sessionKey, "chat", finalPayload);
+      const errorPayload = {
+        runId: clientRunId,
+        sessionKey,
+        seq,
+        state: "error" as const,
+        errorMessage: errorText,
+        errorKind: "hook_block" as const,
+      };
+      broadcast("chat", errorPayload);
+      nodeSendToSession(sessionKey, "chat", errorPayload);
+      // Record this run as terminally finalized via hook_block so the
+      // downstream `chat.send` `.then()` callback skips its own
+      // `broadcastChatFinal`. Without this guard the reply pipeline's
+      // run-failed fallback text (returned by agent-runner-execution) would
+      // be re-broadcast as a second `state: "final"` and overwrite the
+      // block message in the control-ui (which trusts the most recent
+      // `state: "final"` payload).
+      chatRunState.hookFinalizedRuns.set(clientRunId, Date.now());
+      return;
+    }
     const payload = {
       runId: clientRunId,
       sessionKey,
       seq,
       state: "error" as const,
-      errorMessage: error ? formatForLog(error) : undefined,
+      errorMessage: errorText,
       ...(errorKind && { errorKind }),
     };
     broadcast("chat", payload);
@@ -987,8 +1044,13 @@ export function createAgentEventHandler({
 
     if (lifecyclePhase === "error") {
       clearBufferedChatState(clientRunId);
-      const skipChatErrorFinal = isChatSendRunActive(evt.runId) && !chatLink;
-      if (isAborted || lifecycleErrorRetryGraceMs <= 0) {
+      // `hookOverride` is set by deferred lifecycle errors from
+      // llm_output hooks.  The run completed successfully from the
+      // chat.send RPC's perspective, so the normal double-error
+      // prevention (`skipChatErrorFinal`) must not suppress this event.
+      const isHookOverride = evt.data?.hookOverride === true;
+      const skipChatErrorFinal = !isHookOverride && isChatSendRunActive(evt.runId) && !chatLink;
+      if (isAborted || lifecycleErrorRetryGraceMs <= 0 || isHookOverride) {
         finalizeLifecycleEvent(evt, { skipChatErrorFinal });
       } else {
         scheduleTerminalLifecycleError(evt, { skipChatErrorFinal });

@@ -1585,6 +1585,7 @@ export async function runEmbeddedAttempt(
         didSendViaMessagingTool,
         getLastToolError,
         setTerminalLifecycleMeta,
+        resolveTerminalLifecycle,
         getUsageTotals,
         getCompactionCount,
       } = subscription;
@@ -1713,7 +1714,7 @@ export async function runEmbeddedAttempt(
       // The outer run loop reads `promptErrorSource === "hook:llm_output"`
       // together with `llmOutputRetryRequested` to know whether to re-invoke
       // the LLM (true) or surface the block message as a completed turn (false).
-      let llmOutputRetryCount = 0;
+      let llmOutputRetryCount = params.llmOutputRetryCount ?? 0;
       let llmOutputRetryRequested = false;
       try {
         const promptStartedAt = Date.now();
@@ -2510,6 +2511,14 @@ export async function runEmbeddedAttempt(
         }
       }
 
+      // Wrap the llm_output hook section in a try/finally so the deferred
+      // lifecycle terminal event is always resolved — either by the hook
+      // processing path (with an appropriate override) or by the safety net
+      // on unexpected errors.  The safety net MUST NOT run before the hook
+      // code; a previous placement in the inner `finally` (line ~2434)
+      // caused it to fire first and consume the deferred state.
+      try {
+
       if (hookRunner?.hasHooks("llm_output")) {
         const { resolveBlockMessage, DEFAULT_BLOCK_MAX_RETRIES } =
           await import("../../../plugins/hook-decision-types.js");
@@ -2627,17 +2636,45 @@ export async function runEmbeddedAttempt(
             (approvalResult === "timeout" &&
               (llmOutputDecision.timeoutBehavior ?? "deny") === "deny");
           if (shouldDeny) {
+            const denialMessage =
+              llmOutputDecision.denialMessage ?? "Response withheld pending review.";
             log.warn(
               `llm_output hook approval ${approvalResult} (plugin=${llmOutputPluginId}), withholding response${approvalResult === "cancelled" ? " — no approval route available" : ""}`,
             );
             await replaceLlmOutputResponse(
               llmOutputDecision.reason,
               "llm_output:ask",
-              llmOutputDecision.denialMessage ?? "Response withheld pending review.",
+              denialMessage,
             );
+            // Surface the denial through the error path so the
+            // streaming buffer (which already delivered the original
+            // text) is overridden by the error event.
+            promptError = new Error(denialMessage);
+            promptErrorSource = "hook:llm_output";
           } else {
             log.debug(`llm_output hook approval granted (${approvalResult}), delivering response`);
           }
+        }
+
+        // The lifecycle terminal event was deferred while the hook ran.
+        // Resolve it now: if the hook blocked or denied the response,
+        // override to "error" so server-chat broadcasts `state: "error"`
+        // instead of `state: "final"` with the (now-stale) streamed text.
+        // This covers both non-retry blocks (promptError set) and retry
+        // blocks (promptErrorSource set, promptError null) — in both cases
+        // the original streamed text must NOT reach the user.
+        if (promptError) {
+          const errMsg =
+            promptError instanceof Error
+              ? promptError.message
+              : String(promptError);
+          resolveTerminalLifecycle({ error: errMsg });
+        } else if (promptErrorSource === "hook:llm_output") {
+          // Retry case: the original response was scrubbed; emit error to
+          // clear the streaming buffer before the retry starts fresh.
+          resolveTerminalLifecycle({ error: "Response blocked by policy — retrying." });
+        } else {
+          resolveTerminalLifecycle();
         }
       }
 
@@ -2742,6 +2779,16 @@ export async function runEmbeddedAttempt(
         llmOutputRetryRequested,
         llmOutputRetryCount,
       };
+
+      } finally {
+        // Safety net: if the llm_output hook deferred the lifecycle terminal
+        // event but we're leaving without having resolved it (e.g. an
+        // unexpected error in hook processing), emit the original outcome
+        // now so the session doesn't hang indefinitely.
+        // This is a no-op when the hook code already resolved it.
+        resolveTerminalLifecycle();
+      }
+
     } finally {
       // Always tear down the session (and release the lock) before we leave this attempt.
       //

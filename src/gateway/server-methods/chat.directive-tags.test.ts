@@ -283,6 +283,7 @@ function createChatContext(): Pick<
   | "chatDeltaSentAt"
   | "chatDeltaLastBroadcastLen"
   | "chatAbortedRuns"
+  | "chatHookFinalizedRuns"
   | "removeChatRun"
   | "dedupe"
   | "loadGatewayModelCatalog"
@@ -298,6 +299,7 @@ function createChatContext(): Pick<
     chatDeltaSentAt: new Map(),
     chatDeltaLastBroadcastLen: new Map(),
     chatAbortedRuns: new Map(),
+    chatHookFinalizedRuns: new Map(),
     removeChatRun: vi.fn(),
     dedupe: new Map(),
     loadGatewayModelCatalog: async () =>

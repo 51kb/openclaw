@@ -192,6 +192,59 @@ export function handleAgentEnd(ctx: EmbeddedPiSubscribeContext): void | Promise<
     emitLifecycleTerminal();
   };
 
+  // When `llm_output` hooks are registered and the LLM didn't already
+  // error, defer the terminal lifecycle event until the hook in
+  // `attempt.ts` has had a chance to inspect (and possibly block) the
+  // response.  Without this, the subscribe handler emits `phase: "end"`
+  // immediately on `agent_end`, which reaches `server-chat.ts` and
+  // broadcasts `state: "final"` with the full streamed text **before**
+  // the hook can intervene.
+  const shouldDefer =
+    !isError && ctx.hookRunner?.hasHooks("llm_output") === true;
+
+  const emitOrDefer = () => {
+    if (shouldDefer) {
+      ctx.state.deferredTerminalLifecycle = {
+        emit: () => emitLifecycleTerminalOnce(),
+        emitError: (error: string) => {
+          if (lifecycleTerminalEmitted) {
+            return;
+          }
+          lifecycleTerminalEmitted = true;
+          // Override the original "end" with an error lifecycle event.
+          // `hookOverride` tells server-chat.ts to bypass the
+          // `skipChatErrorFinal` guard — the run already completed
+          // successfully from the chat.send RPC's perspective, so the
+          // normal double-error-prevention logic must not suppress this.
+          emitAgentEvent({
+            runId: ctx.params.runId,
+            stream: "lifecycle",
+            data: {
+              phase: "error",
+              error,
+              errorKind: "hook_block",
+              hookOverride: true,
+              ...(livenessState ? { livenessState: "blocked" } : {}),
+              endedAt: Date.now(),
+            },
+          });
+          void ctx.params.onAgentEvent?.({
+            stream: "lifecycle",
+            data: {
+              phase: "error",
+              error,
+              errorKind: "hook_block",
+              hookOverride: true,
+              ...(livenessState ? { livenessState: "blocked" } : {}),
+            },
+          });
+        },
+      };
+      return;
+    }
+    emitLifecycleTerminalOnce();
+  };
+
   try {
     const flushBlockReplyBufferResult = ctx.flushBlockReplyBuffer();
     finalizeAgentEnd();
@@ -201,14 +254,15 @@ export function handleAgentEnd(ctx: EmbeddedPiSubscribeContext): void | Promise<
 
     if (isPromiseLike<void>(flushPendingMediaAndChannelResult)) {
       return Promise.resolve(flushPendingMediaAndChannelResult).finally(() => {
-        emitLifecycleTerminalOnce();
+        emitOrDefer();
       });
     }
   } catch (error) {
+    // On error always emit immediately — don't defer a broken flush.
     emitLifecycleTerminalOnce();
     throw error;
   }
 
-  emitLifecycleTerminalOnce();
+  emitOrDefer();
   return undefined;
 }
