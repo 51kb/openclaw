@@ -2430,6 +2430,7 @@ export async function runEmbeddedAttempt(
 
           if (!skipPromptSubmission) {
             finalPromptText = effectivePrompt;
+            const isRetryAttempt = (params.llmOutputRetryCount ?? 0) > 0;
             const btwSnapshotMessages = activeSession.messages.slice(-MAX_BTW_SNAPSHOT_MESSAGES);
             updateActiveEmbeddedRunSnapshot(params.sessionId, {
               transcriptLeafId,
@@ -2437,34 +2438,28 @@ export async function runEmbeddedAttempt(
               inFlightPrompt: effectivePrompt,
             });
 
-            // Only pass images option if there are actually images to pass
-            // This avoids potential issues with models that don't expect the images parameter
-            if (imageResult.images.length > 0) {
+            if (isRetryAttempt) {
+              // On retry, pass empty string so the SDK does NOT add another
+              // visible user message. The conversation context already
+              // contains the original user message from the first attempt,
+              // so the model will retry from that state.
+              await abortable(activeSession.prompt(""));
+              // Scrub the empty user message the SDK just persisted.
+              try {
+                const { redactDuplicateUserMessage } =
+                  await import("../../../plugins/hook-redaction.js");
+                await redactDuplicateUserMessage(params.sessionFile, "");
+              } catch {
+                // Best-effort cleanup; empty message is harmless if left.
+              }
+            } else if (imageResult.images.length > 0) {
+              // Only pass images option if there are actually images to pass
+              // This avoids potential issues with models that don't expect the images parameter
               await abortable(
                 activeSession.prompt(effectivePrompt, { images: imageResult.images }),
               );
             } else {
               await abortable(activeSession.prompt(effectivePrompt));
-            }
-
-            // HOOK_BLOCK_RETRY: on retry attempts, the SDK persisted ANOTHER
-            // copy of the user prompt at the start of this attempt — scrub
-            // it so the SPA does not show stacked duplicate user bubbles.
-            // Keep the FIRST occurrence (which is from the original turn);
-            // remove only the most recently appended user message that
-            // matches our prompt text.
-            if ((params.llmOutputRetryCount ?? 0) > 0) {
-              try {
-                const { redactDuplicateUserMessage } =
-                  await import("../../../plugins/hook-redaction.js");
-                await redactDuplicateUserMessage(params.sessionFile, effectivePrompt);
-              } catch (err) {
-                log.warn(
-                  `llm_output retry: failed to scrub duplicate user message: ${
-                    (err as Error)?.message ?? String(err)
-                  }`,
-                );
-              }
             }
           }
         } catch (err) {
@@ -2917,22 +2912,29 @@ export async function runEmbeddedAttempt(
             hookPoint: string,
             replacementMessage?: string,
           ) => {
-            const { redactMessages } = await import("../../../plugins/hook-redaction.js");
-            await redactMessages(
-              params.sessionFile,
-              {
-                match: {
-                  role: "assistant",
-                  contentSubstring: (assistantTexts[0] ?? "").slice(0, 100),
+            // Only scrub assistant messages when we have actual streamed text
+            // to match. If assistantTexts is empty, skip the scrub to avoid
+            // accidentally removing previous retry notices or other assistant
+            // messages with an empty-string match.
+            const scrubTarget = (assistantTexts[0] ?? "").trim();
+            if (scrubTarget.length > 0) {
+              const { redactMessages } = await import("../../../plugins/hook-redaction.js");
+              await redactMessages(
+                params.sessionFile,
+                {
+                  match: {
+                    role: "assistant",
+                    contentSubstring: scrubTarget.slice(0, 100),
+                  },
                 },
-              },
-              {
-                reason,
-                hookPoint,
-                pluginId: llmOutputPluginId,
-                timestamp: Date.now(),
-              },
-            );
+                {
+                  reason,
+                  hookPoint,
+                  pluginId: llmOutputPluginId,
+                  timestamp: Date.now(),
+                },
+              );
+            }
             assistantTexts.length = 0;
             if (replacementMessage) {
               assistantTexts.push(replacementMessage);
