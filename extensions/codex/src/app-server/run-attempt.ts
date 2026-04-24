@@ -25,10 +25,13 @@ import {
   runAgentHarnessLlmInputHook,
   runAgentHarnessLlmOutputHook,
   runHarnessContextEngineMaintenance,
+  registerNativeHookRelay,
   setActiveEmbeddedRun,
   supportsModelTools,
   type EmbeddedRunAttemptParams,
   type EmbeddedRunAttemptResult,
+  type NativeHookRelayEvent,
+  type NativeHookRelayRegistrationHandle,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { handleCodexAppServerApprovalRequest } from "./approval-bridge.js";
 import {
@@ -41,6 +44,10 @@ import { projectContextEngineAssemblyForCodex } from "./context-engine-projectio
 import { createCodexDynamicToolBridge } from "./dynamic-tools.js";
 import { handleCodexAppServerElicitationRequest } from "./elicitation-bridge.js";
 import { CodexAppServerEventProjector } from "./event-projector.js";
+import {
+  buildCodexNativeHookRelayConfig,
+  CODEX_NATIVE_HOOK_RELAY_EVENTS,
+} from "./native-hook-relay.js";
 import {
   assertCodexTurnStartResponse,
   readCodexDynamicToolCallParams,
@@ -86,7 +93,17 @@ function emitCodexAppServerEvent(
 
 export async function runCodexAppServerAttempt(
   params: EmbeddedRunAttemptParams,
-  options: { pluginConfig?: unknown; startupTimeoutFloorMs?: number } = {},
+  options: {
+    pluginConfig?: unknown;
+    startupTimeoutFloorMs?: number;
+    nativeHookRelay?: {
+      enabled?: boolean;
+      events?: readonly NativeHookRelayEvent[];
+      ttlMs?: number;
+      gatewayTimeoutMs?: number;
+      hookTimeoutSec?: number;
+    };
+  } = {},
 ): Promise<EmbeddedRunAttemptResult> {
   const attemptStartedAt = Date.now();
   const appServer = resolveCodexAppServerRuntimeOptions({ pluginConfig: options.pluginConfig });
@@ -237,11 +254,26 @@ export async function runCodexAppServerAttempt(
   let client: CodexAppServerClient;
   let thread: CodexAppServerThreadBinding;
   let trajectoryEndRecorded = false;
+  let nativeHookRelay: NativeHookRelayRegistrationHandle | undefined;
   try {
     emitCodexAppServerEvent(params, {
       stream: "codex_app_server.lifecycle",
       data: { phase: "startup" },
     });
+    nativeHookRelay = createCodexNativeHookRelay({
+      options: options.nativeHookRelay,
+      agentId: sessionAgentId,
+      sessionId: params.sessionId,
+      sessionKey: sandboxSessionKey,
+      runId: params.runId,
+    });
+    const nativeHookRelayConfig = nativeHookRelay
+      ? buildCodexNativeHookRelayConfig({
+          relay: nativeHookRelay,
+          events: options.nativeHookRelay?.events,
+          hookTimeoutSec: options.nativeHookRelay?.hookTimeoutSec,
+        })
+      : undefined;
     ({ client, thread } = await withCodexStartupTimeout({
       timeoutMs: params.timeoutMs,
       timeoutFloorMs: options.startupTimeoutFloorMs,
@@ -255,6 +287,7 @@ export async function runCodexAppServerAttempt(
           dynamicTools: toolBridge.specs,
           appServer,
           developerInstructions: promptBuild.developerInstructions,
+          config: nativeHookRelayConfig,
         });
         return { client: startupClient, thread: startupThread };
       },
@@ -264,6 +297,7 @@ export async function runCodexAppServerAttempt(
       data: { phase: "thread_ready", threadId: thread.threadId },
     });
   } catch (error) {
+    nativeHookRelay?.unregister();
     clearSharedCodexAppServerClient();
     params.abortSignal?.removeEventListener("abort", abortFromUpstream);
     throw error;
@@ -459,6 +493,7 @@ export async function runCodexAppServerAttempt(
     });
     notificationCleanup();
     requestCleanup();
+    nativeHookRelay?.unregister();
     await trajectoryRecorder?.flush();
     params.abortSignal?.removeEventListener("abort", abortFromUpstream);
     throw error;
@@ -635,10 +670,42 @@ export async function runCodexAppServerAttempt(
     clearTimeout(timeout);
     notificationCleanup();
     requestCleanup();
+    nativeHookRelay?.unregister();
     runAbortController.signal.removeEventListener("abort", abortListener);
     params.abortSignal?.removeEventListener("abort", abortFromUpstream);
     clearActiveEmbeddedRun(params.sessionId, handle, params.sessionKey);
   }
+}
+
+function createCodexNativeHookRelay(params: {
+  options:
+    | {
+        enabled?: boolean;
+        events?: readonly NativeHookRelayEvent[];
+        ttlMs?: number;
+        gatewayTimeoutMs?: number;
+      }
+    | undefined;
+  agentId: string | undefined;
+  sessionId: string;
+  sessionKey: string | undefined;
+  runId: string;
+}): NativeHookRelayRegistrationHandle | undefined {
+  if (params.options?.enabled !== true) {
+    return undefined;
+  }
+  return registerNativeHookRelay({
+    provider: "codex",
+    ...(params.agentId ? { agentId: params.agentId } : {}),
+    sessionId: params.sessionId,
+    ...(params.sessionKey ? { sessionKey: params.sessionKey } : {}),
+    runId: params.runId,
+    allowedEvents: params.options.events ?? CODEX_NATIVE_HOOK_RELAY_EVENTS,
+    ttlMs: params.options.ttlMs,
+    command: {
+      timeoutMs: params.options.gatewayTimeoutMs,
+    },
+  });
 }
 
 function interruptCodexTurnBestEffort(
