@@ -103,6 +103,60 @@ describe("analyzeBootstrapBudget", () => {
     });
     expect(analysis.truncatedFiles[0]?.causes).toEqual([]);
   });
+
+  it("qualityScore is 100 when no truncation or missing files", () => {
+    const analysis = analyzeBootstrapBudget({
+      files: [
+        { name: "AGENTS.md", path: "/tmp/AGENTS.md", missing: false, rawChars: 100, injectedChars: 100, truncated: false },
+      ],
+      bootstrapMaxChars: 120,
+      bootstrapTotalMaxChars: 200,
+    });
+    expect(analysis.qualityScore).toBe(100);
+  });
+
+  it("qualityScore penalizes missing files", () => {
+    const analysis = analyzeBootstrapBudget({
+      files: [
+        { name: "AGENTS.md", path: "/tmp/AGENTS.md", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+      ],
+      bootstrapMaxChars: 120,
+      bootstrapTotalMaxChars: 200,
+    });
+    expect(analysis.qualityScore).toBe(85); // 100 - 15
+  });
+
+  it("qualityScore penalizes truncated files", () => {
+    const analysis = analyzeBootstrapBudget({
+      files: [
+        { name: "AGENTS.md", path: "/tmp/AGENTS.md", missing: false, rawChars: 150, injectedChars: 50, truncated: true },
+      ],
+      bootstrapMaxChars: 120,
+      bootstrapTotalMaxChars: 200,
+    });
+    // missing=0, truncatedChars=100, cost=min(25, ceil(100/100))=1*25=25, nearLimit=1*2=2
+    // score = 100 - 0 - 25 - 2 = 73
+    expect(analysis.qualityScore).toBe(73);
+  });
+
+  it("qualityScore is capped at 0", () => {
+    const analysis = analyzeBootstrapBudget({
+      files: [
+        { name: "A.md", path: "/A", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "B.md", path: "/B", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "C.md", path: "/C", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "D.md", path: "/D", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "E.md", path: "/E", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "F.md", path: "/F", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "G.md", path: "/G", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+        { name: "H.md", path: "/H", missing: true, rawChars: 0, injectedChars: 0, truncated: false },
+      ],
+      bootstrapMaxChars: 120,
+      bootstrapTotalMaxChars: 200,
+    });
+    // 8 missing files * 15 = 120, capped at 0
+    expect(analysis.qualityScore).toBe(0);
+  });
 });
 
 describe("bootstrap prompt warnings", () => {
