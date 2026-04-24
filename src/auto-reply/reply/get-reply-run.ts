@@ -12,6 +12,7 @@ import {
 } from "../../config/sessions/paths.js";
 import { resolveSessionStoreEntry } from "../../config/sessions/store.js";
 import type { SessionEntry } from "../../config/sessions/types.js";
+import { resolveSilentReplySettings } from "../../config/silent-reply.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { logVerbose } from "../../globals.js";
 import { clearCommandLane, getQueueSize } from "../../process/command-queue.js";
@@ -42,7 +43,7 @@ import type { buildCommandContext } from "./commands.js";
 import type { InlineDirectives } from "./directive-handling.js";
 import { shouldUseReplyFastTestRuntime } from "./get-reply-fast-path.js";
 import { resolvePreparedReplyQueueState } from "./get-reply-run-queue.js";
-import { buildGroupChatContext, buildGroupIntro } from "./groups.js";
+import { buildDirectChatContext, buildGroupChatContext, buildGroupIntro } from "./groups.js";
 import { hasInboundMedia } from "./inbound-media.js";
 import { buildInboundMetaSystemPrompt, buildInboundUserContextPrefix } from "./inbound-meta.js";
 import type { createModelSelectionState } from "./model-selection.js";
@@ -239,6 +240,17 @@ export async function runPreparedReply(
     ctx,
     sessionKey,
   });
+  const silentReplySettings = resolveSilentReplySettings({
+    cfg,
+    sessionKey: runtimePolicySessionKey,
+    surface: sessionCtx.Surface ?? sessionCtx.Provider,
+    conversationType:
+      sessionCtx.ChatType === "group" || sessionCtx.ChatType === "channel"
+        ? "group"
+        : sessionCtx.ChatType === "direct" || sessionCtx.ChatType === "dm"
+          ? "direct"
+          : undefined,
+  });
   let {
     sessionEntry,
     resolvedThinkLevel,
@@ -282,6 +294,15 @@ export async function runPreparedReply(
   const shouldInjectGroupIntro = Boolean(
     isGroupChat && (isFirstTurnInSession || sessionEntry?.groupActivationNeedsSystemIntro),
   );
+  const directChatContext =
+    sessionCtx.ChatType === "direct"
+      ? buildDirectChatContext({
+          sessionCtx,
+          silentReplyPolicy: silentReplySettings.policy,
+          silentReplyRewrite: silentReplySettings.rewrite,
+          silentToken: SILENT_REPLY_TOKEN,
+        })
+      : "";
   // Always include persistent group chat context (provider + reply guidance).
   const groupChatContext = isGroupChat ? buildGroupChatContext({ sessionCtx }) : "";
   // Behavioral intro (activation mode, lurking, etc.) only on first turn / activation needed
@@ -292,6 +313,8 @@ export async function runPreparedReply(
         sessionEntry,
         defaultActivation,
         silentToken: SILENT_REPLY_TOKEN,
+        silentReplyPolicy: silentReplySettings.policy,
+        silentReplyRewrite: silentReplySettings.rewrite,
       })
     : "";
   const groupSystemPrompt = normalizeOptionalString(sessionCtx.GroupSystemPrompt) ?? "";
@@ -301,6 +324,7 @@ export async function runPreparedReply(
   );
   const extraSystemPromptParts = [
     inboundMetaPrompt,
+    directChatContext,
     groupChatContext,
     groupIntro,
     groupSystemPrompt,
@@ -313,6 +337,7 @@ export async function runPreparedReply(
   ].filter(Boolean);
   // Static parts only (no per-message inbound metadata) for CLI session reuse hashing.
   const extraSystemPromptStaticParts = [
+    directChatContext,
     groupChatContext,
     groupIntro,
     groupSystemPrompt,
