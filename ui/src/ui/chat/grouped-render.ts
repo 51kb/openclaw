@@ -739,7 +739,8 @@ function renderAvatar(
 }
 
 function isAvatarUrl(value: string): boolean {
-  return isRenderableControlUiAvatarUrl(value);
+  const trimmed = value.trim();
+  return trimmed.startsWith("blob:") || isRenderableControlUiAvatarUrl(trimmed);
 }
 
 export function resolveAssistantTextAvatar(value: string | null | undefined): string | null {
