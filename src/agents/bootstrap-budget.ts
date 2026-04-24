@@ -30,6 +30,8 @@ export type BootstrapBudgetAnalysis = {
   nearLimitFiles: BootstrapAnalyzedFile[];
   totalNearLimit: boolean;
   hasTruncation: boolean;
+  /** Quality score 0–100. Penalizes truncation and missing files. */
+  qualityScore: number;
   totals: {
     rawChars: number;
     injectedChars: number;
@@ -204,12 +206,25 @@ export function analyzeBootstrapBudget(params: {
   const truncatedFiles = files.filter((file) => file.truncated);
   const nearLimitFiles = files.filter((file) => file.nearLimit);
 
+  // Quality score: start at 100, penalize missing and truncated content.
+  // Each missing file costs 15 pts. Each truncated file costs 5 pts per
+  // truncated chunk, capped at 25 pts per file. Near-limit files cost 2 pts.
+  const missingCount = params.files.filter((f) => f.missing).length;
+  const totalTruncatedChars = truncatedFiles.reduce((sum, f) => sum + Math.max(0, f.rawChars - f.injectedChars), 0);
+  const score =
+    100 -
+    missingCount * 15 -
+    Math.min(25 * truncatedFiles.length, Math.ceil(totalTruncatedChars / 100)) -
+    nearLimitFiles.length * 2;
+  const qualityScore = Math.max(0, Math.min(100, score));
+
   return {
     files,
     truncatedFiles,
     nearLimitFiles,
     totalNearLimit,
     hasTruncation: truncatedFiles.length > 0,
+    qualityScore,
     totals: {
       rawChars,
       injectedChars,
